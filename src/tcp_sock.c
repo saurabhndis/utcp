@@ -198,8 +198,10 @@ static void unlink_from_parent(struct utcp_sock *s)
 void tcp_enter_time_wait(utcp_t *t, struct utcp_sock *s)
 {
     if (t->c->tw_count >= t->r->cfg.max_time_wait) {
-        /* Linux "time wait bucket table overflow": skip TIME_WAIT */
+        /* Linux "time wait bucket table overflow": skip TIME_WAIT, but still
+         * acknowledge the peer's FIN so its LAST_ACK completes. */
         t->st->tcp_tw_overflow++;
+        tcp_send_ack(t, s);
         tcp_finish(t, s);
         return;
     }
@@ -314,8 +316,16 @@ struct utcp_sock *utcp_connect(utcp_t *t, uint32_t dip, uint16_t dport)
         uint32_t bkt = h & (r->cfg.nbuckets - 1);
         if (utcp_bucket_owner(r, bkt) != (int)t->core)
             continue;
-        if (flow_lookup(t, lip, dip, lp, rp))
-            continue;
+        struct utcp_sock *old = flow_lookup(t, lip, dip, lp, rp);
+        if (old) {
+            /* Linux tcp_tw_reuse: recycle a TIME_WAIT port for an outgoing
+             * connection if timestamps protect it (PAWS) and the last segment
+             * from the peer is at least 1 s old. */
+            if (old->state != TCP_TIME_WAIT || !(old->flags & SF_TS_OK) ||
+                t->ops.now_ns(t->ctx) - old->ts_recent_ns < 1000000000ULL)
+                continue;
+            tcp_finish(t, old);
+        }
         struct utcp_sock *s = sock_alloc(t);
         if (!s) {
             errno = ENOMEM;

@@ -1,6 +1,7 @@
 /* utcp backend: multi-queue TAP with virtio-net headers (TSO/GRO, partial
  * checksums). Each worker owns one TAP queue and one utcp core. */
 #include "app.h"
+#include "link.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -13,6 +14,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/uio.h>
+#include <time.h>
 #include <unistd.h>
 
 #define RX_BURST 64
@@ -26,6 +28,54 @@ struct ube {
 };
 
 static struct worker *g_w; /* one worker per process */
+static struct link g_link;  /* set up by the zygote when --link is used */
+static bool g_use_link;
+
+/* Copy a packet into the peer's ring (one copy, like NIC DMA). A full ring is
+ * given a short grace period, then the packet is dropped, as a NIC would. */
+static void link_tx(struct worker *w, struct ube *u, struct utcp_buf *b)
+{
+    int q = link_tx_queue(&g_link, w->sh->region, b);
+    struct link_ring *r = link_tx_ring(&g_link, q);
+    uint32_t len = b->pkt_len;
+    if (len > LINK_MAX_PKT)
+        return;
+    uint32_t need = link_rec_size(len);
+    uint64_t h = atomic_load_explicit(&r->head, memory_order_relaxed);
+    uint32_t pos = (uint32_t)(h % LINK_RING_BYTES);
+    uint32_t pad = (pos + need > LINK_RING_BYTES) ? LINK_RING_BYTES - pos : 0;
+    uint64_t deadline = 0;
+    while (h + pad + need - atomic_load_explicit(&r->tail, memory_order_acquire) >
+           LINK_RING_BYTES) {
+        uint64_t now = now_ns();
+        if (!deadline)
+            deadline = now + 20000;
+        else if (now > deadline) {
+            __atomic_fetch_add(&r->drops, 1, __ATOMIC_RELAXED);
+            return;
+        }
+    }
+    if (pad) {
+        ((struct link_rec *)(r->buf + pos))->len = LINK_WRAP;
+        h += pad;
+        pos = 0;
+    }
+    struct link_rec *rec = (struct link_rec *)(r->buf + pos);
+    uint32_t off = 0;
+    for (struct utcp_buf *f = b; f && off + f->len <= len; f = f->next) {
+        memcpy(rec->data + off, f->data, f->len);
+        off += f->len;
+    }
+    rec->len = off;
+    rec->flags = UTCP_BUF_RX_CSUM_OK; /* trusted virtual wire, like virtio */
+    rec->gso_size = 0;
+    if ((b->flags & UTCP_BUF_TSO) && b->gso_size) {
+        rec->flags |= UTCP_BUF_GRO;
+        rec->gso_size = b->gso_size;
+        u->tx_gso++;
+    }
+    atomic_store_explicit(&r->head, h + need, memory_order_release);
+}
 
 /* ---------------------------------------------------------------- ops */
 
@@ -65,6 +115,15 @@ static int op_tx(void *ctx, struct utcp_buf **pkts, int n)
     struct worker *w = ctx;
     struct ube *u = w->be;
     uint64_t t0 = now_ns();
+    for (int i = 0; g_use_link && i < n; i++) {
+        link_tx(w, u, pkts[i]);
+        u->tx_pkts++;
+        utcp_pkt_free(u->t, pkts[i]);
+    }
+    if (g_use_link) {
+        atomic_fetch_add_explicit(&w->st->io_ns, now_ns() - t0, memory_order_relaxed);
+        return n;
+    }
     for (int i = 0; i < n; i++) {
         struct utcp_buf *b = pkts[i];
         struct virtio_net_hdr vh = {0};
@@ -171,6 +230,8 @@ int utcp_backend_setup(struct shared *sh)
         cfg.rcvbuf = o->rcvbuf;
     cfg.cc = (uint32_t)o->cc;
     cfg.flow_table_size = 1u << 16;
+    if (o->max_tw)
+        cfg.max_time_wait = o->max_tw;
     cfg.ring_size = 8192;
     struct worker zw = {.id = -1, .sh = sh};
     int rc = utcp_region_create(&cfg, &OPS, &zw, &sh->region);
@@ -183,6 +244,12 @@ int utcp_backend_setup(struct shared *sh)
             fprintf(stderr, "buffer pool: out of shared memory\n");
             return -1;
         }
+    if (o->link[0]) {
+        if (link_open(&g_link, o->link, o->role == ROLE_SERVER ? 0 : 1, o->workers))
+            return -1;
+        link_publish(&g_link, sh->region, o->local_ip, o->mac);
+        g_use_link = true;
+    }
     return 0;
 }
 
@@ -278,16 +345,26 @@ static int u_init(struct worker *w)
     u.w = w;
     w->be = &u;
     g_w = w;
-    u.fd = tap_open(w->o->tap);
-    if (u.fd < 0)
-        return -1;
+    if (g_use_link) {
+        u.fd = -1;
+        if (link_wait_peer(&g_link, 10000)) {
+            fprintf(stderr, "link: peer did not come up\n");
+            return -1;
+        }
+        const struct link_side *peer = &g_link.h->side[!g_link.side];
+        utcp_arp_add(w->sh->region, peer->ip, peer->mac); /* point-to-point wire */
+    } else {
+        u.fd = tap_open(w->o->tap);
+        if (u.fd < 0)
+            return -1;
+    }
     u.t = utcp_attach(w->sh->region, (unsigned)w->id, &OPS, w);
     if (!u.t) {
         perror("utcp_attach");
         return -1;
     }
 #ifdef HAVE_BPF
-    if (w->id == 0 && !getenv("UTCP_NO_STEER"))
+    if (w->id == 0 && !g_use_link && !getenv("UTCP_NO_STEER"))
         steer_attach(w, u.fd);
 #endif
     return 0;
@@ -349,8 +426,73 @@ static void u_set_user(struct worker *w, void *h, void *user)
     utcp_sock_set_user(h, user);
 }
 
+static int link_rx_burst(struct worker *w, struct ube *u)
+{
+    struct link_ring *r = link_rx_ring(&g_link, w->id);
+    uint64_t t = atomic_load_explicit(&r->tail, memory_order_relaxed);
+    uint64_t h = atomic_load_explicit(&r->head, memory_order_acquire);
+    struct utcp_buf *pkts[RX_BURST];
+    struct shm *m = w->sh->m;
+    int n = 0;
+    uint64_t t0 = now_ns();
+    while (t != h && n < RX_BURST) {
+        uint32_t pos = (uint32_t)(t % LINK_RING_BYTES);
+        struct link_rec *rec = (struct link_rec *)(r->buf + pos);
+        if (rec->len == LINK_WRAP) {
+            t += LINK_RING_BYTES - pos;
+            continue;
+        }
+        struct utcp_buf *head = NULL, *prev = NULL;
+        uint32_t off = 0;
+        bool ok = true;
+        while (off < rec->len) {
+            struct utcp_buf *f = shm_buf_alloc(m, w->id);
+            if (!f) {
+                ok = false;
+                break;
+            }
+            if (prev)
+                f->data = f->base;
+            uint32_t c = MIN_U32(rec->len - off, utcp_buf_tailroom(f));
+            memcpy(f->data, rec->data + off, c);
+            f->len = c;
+            off += c;
+            if (prev)
+                prev->next = f;
+            else
+                head = f;
+            prev = f;
+        }
+        uint32_t len = rec->len;
+        uint16_t flags = rec->flags, gso = rec->gso_size;
+        t += link_rec_size(len);
+        if (!ok || !head) {
+            if (head)
+                utcp_pkt_free(u->t, head);
+            continue;
+        }
+        head->pkt_len = len;
+        head->flags = flags;
+        head->gso_size = gso;
+        if (gso)
+            u->rx_gso++;
+        pkts[n++] = head;
+    }
+    atomic_store_explicit(&r->tail, t, memory_order_release);
+    uint64_t t1 = now_ns();
+    atomic_fetch_add_explicit(&w->st->io_ns, t1 - t0, memory_order_relaxed);
+    if (n) {
+        u->rx_pkts += (uint64_t)n;
+        utcp_input_burst(u->t, pkts, n);
+        atomic_fetch_add_explicit(&w->st->stack_ns, now_ns() - t1, memory_order_relaxed);
+    }
+    return n;
+}
+
 static int rx_burst(struct worker *w, struct ube *u)
 {
+    if (g_use_link)
+        return link_rx_burst(w, u);
     struct utcp_buf *pkts[RX_BURST];
     int n = 0;
     struct shm *m = w->sh->m;
@@ -418,6 +560,16 @@ static int u_run(struct worker *w, int timeout_us)
     uint64_t t0 = now_ns();
     work += utcp_poll(u->t);
     atomic_fetch_add_explicit(&w->st->stack_ns, now_ns() - t0, memory_order_relaxed);
+    static unsigned idle;
+    if (g_use_link) { /* no fd to sleep on: spin briefly, then nap */
+        idle = work ? 0 : idle + 1;
+        if (!w->o->busy_poll && idle > 2000) {
+            uint64_t nt = utcp_next_timer(u->t), now = now_ns();
+            if (nt > now + 20000)
+                nanosleep(&(struct timespec){0, 20000}, NULL);
+        }
+        return work;
+    }
     if (!work && timeout_us > 0 && !w->o->busy_poll) {
         uint64_t nt = utcp_next_timer(u->t), now = now_ns();
         int to = timeout_us;
@@ -430,6 +582,24 @@ static int u_run(struct worker *w, int timeout_us)
         }
     }
     return work;
+}
+
+static void count_state(void *arg, struct utcp_sock *s)
+{
+    struct utcp_info i;
+    utcp_sock_info(s, &i);
+    ((unsigned *)arg)[i.state]++;
+}
+
+void utcp_backend_census(struct worker *w)
+{
+    unsigned n[16] = {0};
+    utcp_foreach_sock(((struct ube *)w->be)->t, count_state, n);
+    fprintf(stderr, "  worker %d sockets:", w->id);
+    for (int st = 0; st < 11; st++)
+        if (n[st])
+            fprintf(stderr, " %s=%u", utcp_state_name(st), n[st]);
+    fprintf(stderr, "\n");
 }
 
 void utcp_backend_dump(struct worker *w, void *h)

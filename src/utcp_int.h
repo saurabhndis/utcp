@@ -408,7 +408,7 @@ struct utcp_inst {
     int ntx;
     struct utcp_sock *ev_list, *dirty_list, *free_list;
     int in_burst;
-    struct utcp_buf *arp_pending[64];
+    struct utcp_buf *arp_pending[1024]; /* awaiting ARP resolution */
     int narp_pending;
     struct utcp_buf *defer_head, *defer_tail; /* packets for a bucket mid-migration */
 };

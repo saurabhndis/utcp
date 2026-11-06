@@ -34,6 +34,7 @@ struct conn {
     uint64_t tx_off, rx_off, tx_total, rx_total;
     uint32_t tx_seed, rx_seed;
     uint32_t msg_got, out_left;
+    uint32_t ntrans;
     uint64_t t_start;
 };
 
@@ -282,7 +283,8 @@ static int process(struct worker *w, struct conn *c, const uint8_t *p, size_t n)
         uint64_t t = now_ns();
         hist_add(w->st, t - c->t_start);
         atomic_fetch_add_explicit(&w->st->transactions, 1, memory_order_relaxed);
-        if (w->o->wl == WL_CRR || w->stopping)
+        if (w->o->wl == WL_CRR || w->stopping ||
+            (w->o->trans && ++c->ntrans >= w->o->trans))
             return P_DONE;
         c->t_start = t;
         c->out_left = w->o->req;
@@ -374,6 +376,14 @@ static void client_open(struct worker *w)
     c->state = C_CONNECTING;
     c->t_start = now_ns();
     c->h = w->tp->connect(w, w->o->peer_ip, w->o->port);
+    if (!c->h && (errno == EADDRNOTAVAIL || errno == EAGAIN || errno == EMFILE)) {
+        w->retry_opens++; /* local resources exhausted for now: try again later */
+        c->state = C_FREE;
+        c->next_free = w->free_conns;
+        w->free_conns = c;
+        w->active--;
+        return;
+    }
     if (!c->h) {
         atomic_fetch_add_explicit(&w->st->conn_errors, 1, memory_order_relaxed);
         c->state = C_FREE;
@@ -442,9 +452,13 @@ void wl_tick(struct worker *w)
 {
     if (w->o->role != ROLE_CLIENT || w->stopping)
         return;
+    for (int n = w->retry_opens; n > 0 && w->retry_opens; n--) {
+        w->retry_opens--;
+        client_open(w);
+    }
     if (now_ns() >= w->stop_at) {
         w->stopping = true;
-        if (w->o->wl == WL_STREAM) /* hard deadline for streams */
+        if (w->o->wl == WL_STREAM || w->o->trans) /* hard deadline: abort what is left */
             for (int i = 0; i < w->nconns_max; i++)
                 if (w->conns[i].state != C_FREE) {
                     atomic_fetch_add_explicit(&w->st->conn_errors, 1, memory_order_relaxed);
@@ -456,6 +470,8 @@ void wl_tick(struct worker *w)
 void wl_dump(struct worker *w)
 {
     fprintf(stderr, "worker %d: active %d stopping %d\n", w->id, w->active, w->stopping);
+    if (w->o->backend == BE_UTCP)
+        utcp_backend_census(w);
     for (int i = 0; i < w->nconns_max; i++) {
         struct conn *c = &w->conns[i];
         if (c->state == C_FREE)
@@ -473,7 +489,7 @@ bool wl_done(struct worker *w)
 {
     if (w->o->role != ROLE_CLIENT)
         return false;
-    if (w->o->wl == WL_STREAM)
+    if (w->o->wl == WL_STREAM || (w->o->wl == WL_RR && w->o->trans))
         return w->active == 0;
-    return w->stopping && w->active == 0;
+    return w->stopping && w->active == 0;  /* pending retries are dropped at stop */
 }

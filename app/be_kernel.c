@@ -27,6 +27,7 @@ struct ksock {
 struct kbe {
     int ep;
     struct ksock lsn;
+    int lsn_retry; /* accept stopped on an error (e.g. EMFILE): retry next loop */
     struct ksock *dead; /* freed after the current epoll batch */
 };
 
@@ -148,19 +149,28 @@ static void k_set_user(struct worker *w, void *h, void *user)
 static int k_run(struct worker *w, int timeout_us)
 {
     struct kbe *k = w->be;
-    struct epoll_event ev[MAXEV];
-    int to = w->o->busy_poll ? 0 : (timeout_us + 999) / 1000;
+    struct epoll_event ev[MAXEV + 1];
+    int to = (w->o->busy_poll || k->lsn_retry) ? 0 : (timeout_us + 999) / 1000;
     uint64_t t0 = now_ns();
     int n = epoll_wait(k->ep, ev, MAXEV, to);
     uint64_t t1 = now_ns();
     atomic_fetch_add_explicit(&w->st->io_ns, t1 - t0, memory_order_relaxed);
-    for (int i = 0; i < n; i++) {
+    int nev = n;
+    if (k->lsn_retry && k->lsn.listener) {
+        ev[nev].data.ptr = &k->lsn; /* edge-triggered: re-drive a stalled accept loop */
+        ev[nev++].events = EPOLLIN;
+    }
+    for (int i = 0; i < nev; i++) {
         struct ksock *s = ev[i].data.ptr;
         if (s->listener) {
+            k->lsn_retry = 0;
             for (;;) {
                 int fd = accept4(s->fd, NULL, NULL, SOCK_NONBLOCK);
-                if (fd < 0)
+                if (fd < 0) {
+                    if (errno != EAGAIN && errno != EWOULDBLOCK)
+                        k->lsn_retry = 1;
                     break;
+                }
                 tune(w, fd);
                 wl_on_accept(w, ks_new(w, fd));
             }

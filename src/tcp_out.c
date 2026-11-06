@@ -516,11 +516,11 @@ void tcp_rearm_rtx(utcp_t *t, struct utcp_sock *s)
     uint64_t rto = t->now + ((uint64_t)s->rto_ms << s->backoff) * 1000000ULL;
     if (s->ca_state == CA_OPEN && (s->flags & SF_SACK_OK) && s->srtt_us && !s->tlp_high_seq &&
         !s->backoff) {
-        /* RFC 8985 tail loss probe */
+        /* RFC 8985 tail loss probe, Linux tcp_schedule_loss_probe():
+         * 2*srtt + TCP_TIMEOUT_MIN (2 ms), or + TCP_RTO_MIN if only one
+         * segment is outstanding (the peer may be delaying its ACK). */
         uint64_t pto = 2ull * s->srtt_us;
-        if (s->snd_nxt - s->snd_una <= s->mss)
-            pto = MAX(pto, (uint64_t)s->srtt_us * 3 / 2 + 200000);
-        pto = MAX(pto, 2000u);
+        pto += (s->snd_nxt - s->snd_una <= s->mss) ? 200000u : 2000u;
         uint64_t d = t->now + pto * 1000;
         if (d < rto) {
             s->rtx_kind = RTX_TLP;

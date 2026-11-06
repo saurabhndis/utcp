@@ -52,11 +52,15 @@ static void usage(void)
             "  --gw A.B.C.D       utcp: default gateway\n"
             "  --port P           [5001]\n"
             "  --tap NAME         utcp: multi-queue TAP device           [utap0]\n"
+            "  --max-tw N         utcp: TIME_WAIT cap per core (like tcp_max_tw_buckets)\n"
+            "  --link NAME        utcp: shared-memory link to another utcp-app instead of TAP\n"
+            "                     (server = side 0, client = side 1; same --workers)\n"
             "  --mac XX:..        utcp: stack MAC                        [02:00:00:00:00:02]\n"
             "  --workload stream|rr|crr                                  [stream]\n"
             "  --conns N          client: connections per worker         [1]\n"
             "  --c2s BYTES --s2c BYTES   stream sizes per connection     [1G 0]\n"
             "  --req B --resp B   rr/crr message sizes                   [64 64]\n"
+            "  --trans N          rr: requests per connection, then close [0: until duration]\n"
             "  --duration SEC     rr/crr run time; stream deadline       [10]\n"
             "  --no-verify        skip payload verification\n"
             "  --busy-poll        never sleep\n"
@@ -100,7 +104,7 @@ static void parse(int argc, char **argv, struct opts *o)
     o->role = ROLE_SERVER;
     enum { O_BACKEND = 256, O_ROLE, O_WORKERS, O_CPU, O_IP, O_PEER, O_GW, O_PORT, O_TAP, O_MAC,
            O_WL, O_CONNS, O_C2S, O_S2C, O_REQ, O_RESP, O_DUR, O_NOVERIFY, O_BUSY, O_NOTSO,
-           O_BUFS, O_BUFSZ, O_SNDBUF, O_RCVBUF, O_JSON, O_CC };
+           O_BUFS, O_BUFSZ, O_SNDBUF, O_RCVBUF, O_JSON, O_CC, O_TRANS, O_LINK, O_MAXTW };
     static const struct option lo[] = {
         {"backend", 1, 0, O_BACKEND}, {"role", 1, 0, O_ROLE},       {"workers", 1, 0, O_WORKERS},
         {"cpu", 1, 0, O_CPU},         {"ip", 1, 0, O_IP},           {"peer", 1, 0, O_PEER},
@@ -110,7 +114,8 @@ static void parse(int argc, char **argv, struct opts *o)
         {"resp", 1, 0, O_RESP},       {"duration", 1, 0, O_DUR},    {"no-verify", 0, 0, O_NOVERIFY},
         {"busy-poll", 0, 0, O_BUSY},  {"no-tso", 0, 0, O_NOTSO},    {"bufs", 1, 0, O_BUFS},
         {"buf-size", 1, 0, O_BUFSZ},  {"sndbuf", 1, 0, O_SNDBUF},   {"rcvbuf", 1, 0, O_RCVBUF},
-        {"json", 0, 0, O_JSON},       {"cc", 1, 0, O_CC},           {0, 0, 0, 0},
+        {"json", 0, 0, O_JSON},       {"cc", 1, 0, O_CC},           {"trans", 1, 0, O_TRANS},     {"link", 1, 0, O_LINK},       {"max-tw", 1, 0, O_MAXTW},
+        {0, 0, 0, 0},
     };
     int c;
     while ((c = getopt_long(argc, argv, "h", lo, NULL)) != -1) {
@@ -149,6 +154,9 @@ static void parse(int argc, char **argv, struct opts *o)
         case O_RCVBUF: o->rcvbuf = (uint32_t)parse_size(optarg); break;
         case O_JSON: o->json = true; break;
         case O_CC: o->cc = !strcmp(optarg, "reno") ? UTCP_CC_RENO : UTCP_CC_CUBIC; break;
+        case O_TRANS: o->trans = (uint32_t)atoi(optarg); break;
+        case O_LINK: snprintf(o->link, sizeof(o->link), "%s", optarg); break;
+        case O_MAXTW: o->max_tw = (uint32_t)atoi(optarg); break;
         default: usage();
         }
     }
@@ -303,6 +311,15 @@ int main(int argc, char **argv)
 {
     struct opts o;
     parse(argc, argv, &o);
+    /* kernel backend: one fd per connection */
+    struct rlimit rl;
+    if (!getrlimit(RLIMIT_NOFILE, &rl)) {
+        rl.rlim_cur = rl.rlim_max;
+        if (setrlimit(RLIMIT_NOFILE, &rl) || rl.rlim_cur < 1048576) {
+            struct rlimit big = {1048576, 1048576};
+            setrlimit(RLIMIT_NOFILE, &big); /* root may raise the hard limit */
+        }
+    }
     setvbuf(stdout, NULL, _IOLBF, 0);
     size_t shm_size = sizeof(struct shared) + ((size_t)256 << 20);
     if (o.backend == BE_UTCP)

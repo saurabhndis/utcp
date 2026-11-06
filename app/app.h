@@ -24,10 +24,13 @@ struct opts {
     uint32_t gw_ip;
     uint16_t port;
     char tap[16];
+    char link[32];          /* utcp: shared-memory link name instead of TAP */
     uint8_t mac[6];
     int conns;              /* client: concurrent connections per worker */
     uint64_t c2s, s2c;      /* stream bytes per connection */
     uint32_t req, resp;     /* rr/crr message sizes */
+    uint32_t trans;         /* rr: requests per connection, then close (0 = until duration) */
+    uint32_t max_tw;        /* utcp: TIME_WAIT cap per core (0 = library default) */
     double duration;        /* seconds (rr/crr; stream: upper bound) */
     bool verify;
     uint32_t nbufs;         /* utcp packet buffers per worker */
@@ -105,6 +108,7 @@ struct worker {
     int active;
     uint64_t stop_at;
     bool stopping;
+    int retry_opens;         /* client: connects to retry (e.g. ports exhausted) */
 };
 
 #define MIN_U32(a, b) ((uint32_t)(a) < (uint32_t)(b) ? (uint32_t)(a) : (uint32_t)(b))
@@ -122,5 +126,6 @@ bool wl_done(struct worker *w);
 size_t wl_conn_size(void);
 void wl_dump(struct worker *w); /* SIGUSR1: print per-connection state */
 void utcp_backend_dump(struct worker *w, void *h);
+void utcp_backend_census(struct worker *w);
 
 #endif

@@ -12,5 +12,5 @@ if bpf.found() and clang.found()
                 build_by_default : true, install : true,
                 install_dir : get_option('bindir'))
 endif
-executable('utcp-app', ['main.c', 'workload.c', 'shm.c', 'be_utcp.c', 'be_kernel.c'],
+executable('utcp-app', ['main.c', 'workload.c', 'shm.c', 'link.c', 'be_utcp.c', 'be_kernel.c'],
            c_args : app_args, dependencies : app_deps, install : true)

@@ -145,6 +145,22 @@ Bulk streams are limited by TAP itself. Every payload byte crosses the user/kern
 with a copy, while veth passes skbs without copying. On a NIC with DPDK those copies become
 DMA. Workloads dominated by packet rate (RR/CRR) already favour utcp.
 
+### utcp ↔ utcp vs kernel ↔ kernel
+
+`--link NAME` connects two `utcp-app` instances through a shared-memory link with NIC-like
+semantics: one copy per packet, burst I/O with no system calls, RSS steering with the
+receiver's bucket table, and 32 MiB byte rings per queue. This takes the kernel out of the
+path entirely (`scripts/u2u_vs_k2k.sh`, `scripts/get10k.sh`). The kernel pair runs over veth.
+
+| Workload | kernel ↔ kernel | utcp ↔ utcp |
+|---|---|---|
+| 10k concurrent conns × 10 GETs × 64 KiB responses | 256 k req/s, 134 Gbit/s | 228 k req/s, 120 Gbit/s |
+| RR, 1 conn | 90 k tps, p50 10.8 µs (busy-poll) | **1.47 M tps, p50 0.6 µs** |
+| RR, 64 conns, 4 workers | 1.11 M tps | **10.6 M tps** |
+| CRR, 4 workers | 172 k conn/s, p99 655 µs | **2.69 M conn/s, p99 26 µs** |
+| Stream, 1 conn | 115 Gbit/s | 120 Gbit/s |
+| Stream, 16 conns, 4 workers | **235 Gbit/s** | 97 Gbit/s |
+
 **Loss behaviour versus Linux** (`scripts/loss_cmp.sh`: utcp sending vs Linux sending, with
 per-packet netem loss on both paths, segmentation offload and GRO off):
 
@@ -176,13 +192,14 @@ undone as spurious.
   (`__tcp_cleanup_rbuf`), zero-window probes.
 - **Sending**: Nagle / NODELAY, TSO autosizing to about 1 ms of pacing rate.
 - **Offloads**: GRO input (virtio `gso_size`), TX and RX checksum offload.
+- **TIME_WAIT**: a per-core cap like `tcp_max_tw_buckets` (the FIN is still ACKed on
+  overflow), and `tcp_tw_reuse` for outgoing connections.
 - **ISN**: RFC 6528 with SipHash-2-4. **PMTU**: ICMP "fragmentation needed".
 
 ## Not implemented yet
 
 IPv6, BBRv3, ECN/AccECN, TCP Fast Open, SYN cookies, keepalive, IP fragment reassembly
-(fragments are dropped; TCP sets DF), a cap on TIME_WAIT entries and compact TIME_WAIT
-entries, pacing beyond TSO autosizing, receive-buffer autotuning (`rcvbuf` is fixed per
+(fragments are dropped; TCP sets DF), compact TIME_WAIT entries, pacing beyond TSO autosizing, receive-buffer autotuning (`rcvbuf` is fixed per
 socket), and the DPDK adapter in `utcp-app`. The library API already has what the DPDK
 adapter needs: the RSS key and RETA, TX offload metadata (`l4_off`, `l4_hlen`, `gso_size`)
 and zero-copy references.

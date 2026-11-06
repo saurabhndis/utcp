@@ -48,6 +48,8 @@ up() {
     # TAP for utcp
     ip netns exec peer ip tuntap add dev utap0 mode tap multi_queue
     ip netns exec peer ip addr add 10.10.0.1/24 dev utap0
+    # per-queue ring (like NIC RX ring size); the 1000 default overflows at 10k conns
+    ip netns exec peer ip link set utap0 txqueuelen 16384
     ip netns exec peer ip link set utap0 up
     # veth for the kernel backend
     ip link add vk0 type veth peer name vk1
