@@ -1,0 +1,7 @@
+build*/
+*.o
+*.pcap
+fuzz_input
+crash-*
+leak-*
+.DS_Store
